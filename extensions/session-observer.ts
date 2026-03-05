@@ -2,13 +2,12 @@
  * Session Observer — Silent workflow analyst
  *
  * Watches an entire Pi session for workflow signals:
- * corrections, aborts, tool excess, scope drift, reprompts.
+ * corrections, tool excess, scope drift, reprompts.
  *
  * At session end, a Sonnet subagent synthesises the signals into
  * actionable agent improvement suggestions.
  *
  * Reports saved to .pi/observer/sessions/<date>.md
- * Cumulative patterns saved to .pi/observer/improvements.md
  *
  * Usage: pi -e extensions/session-observer.ts
  * Commands: /observer report | /observer clear | /observer history
@@ -29,15 +28,8 @@ interface Correction {
     userMessage: string;
 }
 
-interface Abort {
-    turn: number;
-    toolName: string;
-    toolInput: string;
-}
-
 interface SessionSignals {
     corrections: Correction[];
-    aborts: Abort[];
     toolCounts: Record<string, number>;
     toolExcess: string[];
     turnCount: number;
@@ -74,7 +66,6 @@ You analyse session signals to identify pain points and suggest improvements.
 
 You receive structured data about a session:
 - Course corrections (user had to rephrase or redirect the agent)
-- Aborts (agent went off track mid-turn)
 - Tool usage patterns (excessive tool use = poor orientation or indecision)
 - Turn counts (high turns for simple tasks = poor task decomposition)
 - Files touched (scope drift = agent edited unrelated files)
@@ -150,15 +141,7 @@ function buildSignalSummary(signals: SessionSignals): string {
     }
     lines.push(``);
 
-    lines.push(`### Aborts (${signals.aborts.length})`);
-    if (signals.aborts.length === 0) {
-        lines.push(`None detected.`);
-    } else {
-        signals.aborts.forEach((a, i) => {
-            lines.push(`${i + 1}. Turn ${a.turn} — ${a.toolName}: "${a.toolInput.slice(0, 80)}"`);
-        });
-    }
-    lines.push(``);
+
 
     lines.push(`### Tool Usage`);
     const toolEntries = Object.entries(signals.toolCounts).sort(([, a], [, b]) => b - a);
@@ -204,7 +187,6 @@ async function runEvaluator(signals: SessionSignals, ctx: ExtensionContext): Pro
 
         const signalJson = JSON.stringify({
             corrections: signals.corrections,
-            aborts: signals.aborts,
             toolCounts: signals.toolCounts,
             toolExcess: signals.toolExcess,
             turnCount: signals.turnCount,
@@ -302,7 +284,6 @@ async function generateReport(signals: SessionSignals, ctx: ExtensionContext): P
 export default function (pi: ExtensionAPI) {
     let signals: SessionSignals = {
         corrections: [],
-        aborts: [],
         toolCounts: {},
         toolExcess: [],
         turnCount: 0,
@@ -324,7 +305,6 @@ export default function (pi: ExtensionAPI) {
     function resetSignals() {
         signals = {
             corrections: [],
-            aborts: [],
             toolCounts: {},
             toolExcess: [],
             turnCount: 0,
@@ -346,7 +326,7 @@ export default function (pi: ExtensionAPI) {
     function updateStatus(ctx: ExtensionContext) {
         const parts = [];
         if (signals.corrections.length > 0) parts.push(`${signals.corrections.length} corrections`);
-        if (signals.aborts.length > 0) parts.push(`${signals.aborts.length} aborts`);
+
         const topTool = Object.entries(signals.toolCounts).sort(([, a], [, b]) => b - a)[0];
         if (topTool) parts.push(`${topTool[0]}:${topTool[1]}`);
 
@@ -395,7 +375,6 @@ export default function (pi: ExtensionAPI) {
         } else {
             signals.consecutiveInputsWithoutToolCall = 0;
         }
-        toolCalledThisTurn = false;
 
         return { action: "continue" as const };
     });
@@ -416,7 +395,6 @@ export default function (pi: ExtensionAPI) {
     pi.on("tool_call", async (event, ctx) => {
         toolCalledThisTurn = true;
 
-        // Track aborts — if ctx.abort() was called previously this fires after
         // Track file scope
         if (isToolCallEventType("read", event)) {
             const filePath = event.input.path;
@@ -437,15 +415,6 @@ export default function (pi: ExtensionAPI) {
     pi.on("tool_execution_end", async (event, ctx) => {
         signals.toolCounts[event.toolName] = (signals.toolCounts[event.toolName] || 0) + 1;
         updateStatus(ctx);
-    });
-
-    // ── agent_end ─────────────────────────────────────────────────────────────
-    // Fired when agent turn is aborted or ends
-    pi.on("agent_end", async (event, ctx) => {
-        // Check if any messages indicate an abort happened
-        // We track this via tool_call interception by damage-control or similar
-        // The agent_end fires even on normal completion, so we use it to
-        // detect if the last tool was blocked
     });
 
     // ── session_shutdown ──────────────────────────────────────────────────────
