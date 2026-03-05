@@ -6,6 +6,28 @@ A curated collection of [Pi](https://shittycodingagent.ai) extensions, agent pat
 
 ---
 
+## Usage
+
+### Load everything at once (recommended)
+
+```bash
+pi -e extensions/providers/AppExtensionProvider.ts
+```
+
+`AppExtensionProvider` boots all extensions with a single command — inspired by Laravel's `AppServiceProvider`. To add or remove an extension, edit the provider file.
+
+### Load individual extensions
+
+Each extension is standalone and can be loaded on its own:
+
+```bash
+pi -e extensions/my-footer.ts
+pi -e extensions/session-observer.ts
+pi -e extensions/blog-writer.ts
+```
+
+---
+
 ## Extensions
 
 ### `my-footer.ts` — Custom Footer
