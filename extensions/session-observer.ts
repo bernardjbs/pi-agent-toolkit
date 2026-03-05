@@ -267,25 +267,6 @@ function writeReport(
     return filepath;
 }
 
-function appendToImprovements(evaluation: string, observerDir: string, date: string) {
-    const improvementsPath = path.join(observerDir, "improvements.md");
-
-    const entry = [
-        ``,
-        `---`,
-        ``,
-        `## Session: ${date}`,
-        ``,
-        evaluation,
-    ].join("\n");
-
-    if (!fs.existsSync(improvementsPath)) {
-        fs.writeFileSync(improvementsPath, `# Agent Improvement Log\n\nCumulative suggestions from session observer.\n`, "utf8");
-    }
-
-    fs.appendFileSync(improvementsPath, entry, "utf8");
-}
-
 async function generateReport(signals: SessionSignals, ctx: ExtensionContext): Promise<string> {
     const observerDir = path.join(ctx.cwd, ".pi", "observer");
     ensureDir(observerDir);
@@ -312,7 +293,6 @@ async function generateReport(signals: SessionSignals, ctx: ExtensionContext): P
 
     const evaluation = await runEvaluator(signals, ctx);
     const reportPath = writeReport(signals, evaluation, observerDir);
-    appendToImprovements(evaluation, observerDir, formatDate(signals.startTime));
 
     return reportPath;
 }
