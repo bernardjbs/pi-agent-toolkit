@@ -2,3 +2,4 @@ node_modules/
 .pi/observer/
 .pi/agent-sessions/
 *.env
+package-lock.json
