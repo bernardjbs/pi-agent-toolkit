@@ -1,5 +1,6 @@
 node_modules/
 .pi/observer/
 .pi/agent-sessions/
+.pi/blog/drafts/
 *.env
 package-lock.json
