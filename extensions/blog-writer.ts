@@ -153,21 +153,43 @@ async function draftPost(
 // ─── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-    // Last draft in memory for save workflow
     let lastDraft: { title: string; slug: string; content: string } | null = null;
+    let sourceFile: string | null = null; // set via /blog set <file>
+
+    function resolveSourceFile(cwd: string): string {
+        if (sourceFile) return sourceFile;
+        // Default fallback
+        return path.join(cwd, "SUMMARY.md");
+    }
 
     pi.registerCommand("blog", {
-        description: "Blog writer: list | draft <topic> | drafts | help",
+        description: "Blog writer: set <file> | list | draft <topic> | drafts | help",
         handler: async (args, ctx) => {
             const input = (args ?? "").trim();
             const [cmd, ...rest] = input.split(/\s+/);
             const topic = rest.join(" ").trim();
 
-            // Locate SUMMARY.md — walk up from cwd
-            const summaryPath = path.join(ctx.cwd, "SUMMARY.md");
+            const summaryPath = resolveSourceFile(ctx.cwd);
+
+            // ── set ───────────────────────────────────────────────────────────
+            if (cmd === "set") {
+                if (!topic) {
+                    ctx.ui.notify("Usage: /blog set <path-to-file.md>", "warning");
+                    return;
+                }
+                const resolved = path.isAbsolute(topic)
+                    ? topic
+                    : path.join(ctx.cwd, topic);
+
+                if (!fs.existsSync(resolved)) {
+                    ctx.ui.notify(`File not found: ${resolved}`, "warning");
+                    return;
+                }
+                sourceFile = resolved;
+                ctx.ui.notify(`📝 Source set to: ${resolved}`, "info");
 
             // ── list ──────────────────────────────────────────────────────────
-            if (cmd === "list") {
+            } else if (cmd === "list") {
                 const sections = parseSections(summaryPath);
                 if (sections.length === 0) {
                     ctx.ui.notify("No SUMMARY.md found or no ## sections in it.", "warning");
@@ -235,13 +257,16 @@ export default function (pi: ExtensionAPI) {
 
             // ── help ──────────────────────────────────────────────────────────
             } else if (cmd === "help" || !cmd) {
+                const current = sourceFile ?? path.join(ctx.cwd, "SUMMARY.md");
                 ctx.ui.notify(
                     `📝 Blog Writer — commands:\n\n` +
-                    `  /blog list           — list all draftable sections from SUMMARY.md\n` +
+                    `  /blog set <file>     — point to any markdown file as source\n` +
+                    `  /blog list           — list all draftable ## sections in source file\n` +
                     `  /blog draft <topic>  — draft a post from the matching section\n` +
                     `  /blog draft <number> — draft by section number from /blog list\n` +
                     `  /blog drafts         — list saved drafts\n` +
                     `  /blog help           — show this message\n\n` +
+                    `Current source: ${current}\n` +
                     `Drafts saved to: .pi/blog/drafts/<slug>.md`,
                     "info"
                 );
