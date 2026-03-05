@@ -580,42 +580,44 @@ export default function (pi: ExtensionAPI) {
     });
 
     // ── session_shutdown ──────────────────────────────────────────────────────
-    pi.on("session_shutdown", async (_event, ctx) => {
-        if (signals.turnCount === 0) return;
-
-        try {
-            const { evaluation } = await generateReport(signals, ctx);
-            lastEvaluation = evaluation;
-
-            if (evaluation.painPoints.length === 0) {
-                // Clean session — stay silent
-                return;
-            }
-
-            // Surface pain points
-            const top = evaluation.painPoints[0];
-            const more = evaluation.painPoints.length > 1
-                ? ` (+${evaluation.painPoints.length - 1} more)`
-                : "";
-
-            ctx.ui.notify(
-                `👁 Pain point detected${more}: ${top.issue}\nRun /observer fix to see suggestions`,
-                "warning"
-            );
-        } catch (err) {
-            ctx.ui.notify(`👁 Observer error: ${err instanceof Error ? err.message : String(err)}`, "error");
-        }
+    pi.on("session_shutdown", async (_event, _ctx) => {
+        // Evaluation is explicit via /observer evaluate — nothing happens on exit
     });
 
     // ── Commands ──────────────────────────────────────────────────────────────
 
     pi.registerCommand("observer", {
-        description: "Session observer: fix | report | clear | history",
+        description: "Session observer: evaluate | fix | report | clear | history",
         handler: async (args, ctx) => {
             const cmd = (args ?? "").trim();
 
+            // ── evaluate ──────────────────────────────────────────────────────
+            if (cmd === "evaluate") {
+                if (signals.turnCount === 0) {
+                    ctx.ui.notify("No activity to evaluate yet.", "warning");
+                    return;
+                }
+
+                const { evaluation } = await generateReport({ ...signals }, ctx);
+                lastEvaluation = evaluation;
+
+                if (evaluation.painPoints.length === 0) {
+                    ctx.ui.notify(`👁 Session efficiency: ${evaluation.efficiency}/10 — no pain points detected.`, "info");
+                    return;
+                }
+
+                const top = evaluation.painPoints[0];
+                const more = evaluation.painPoints.length > 1
+                    ? ` (+${evaluation.painPoints.length - 1} more)`
+                    : "";
+
+                ctx.ui.notify(
+                    `👁 Efficiency: ${evaluation.efficiency}/10 — Pain point${more}: ${top.issue}\nType /observer fix to apply suggestions`,
+                    "warning"
+                );
+
             // ── fix ───────────────────────────────────────────────────────────
-            if (cmd === "fix") {
+            } else if (cmd === "fix") {
                 if (!lastEvaluation) {
                     ctx.ui.notify("No evaluation available. Run a session first.", "warning");
                     return;
@@ -689,7 +691,7 @@ export default function (pi: ExtensionAPI) {
                 ctx.ui.notify(`Last ${files.length} sessions:\n${files.join("\n")}`, "info");
 
             } else {
-                ctx.ui.notify("Usage: /observer fix | /observer report | /observer clear | /observer history", "info");
+                ctx.ui.notify("Usage: /observer evaluate | /observer fix | /observer report | /observer clear | /observer history", "info");
             }
         }
     });
