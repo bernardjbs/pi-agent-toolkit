@@ -5,5 +5,8 @@
   "description": "Curated Pi coding agent extensions and workflow tools",
   "dependencies": {
     "@mariozechner/pi-coding-agent": "^0.55.4"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
   }
 }
