@@ -1,16 +1,17 @@
 /**
  * Session Observer — Silent workflow analyst
  *
- * Watches an entire Pi session for workflow signals:
- * corrections, tool excess, scope drift, reprompts.
+ * Watches a Pi session and collects technical workflow signals:
+ * tool usage, file read/edit ratios, reprompts, dispatch patterns.
  *
- * At session end, a Sonnet subagent synthesises the signals into
- * actionable agent improvement suggestions.
- *
- * Reports saved to .pi/observer/sessions/<date>.md
+ * Commands:
+ *   /observer evaluate  — run evaluator, surface pain points
+ *   /observer fix       — show diff + confirm + apply suggestions
+ *   /observer report    — save full markdown report
+ *   /observer clear     — reset signals
+ *   /observer history   — list recent reports
  *
  * Usage: pi -e extensions/session-observer.ts
- * Commands: /observer report | /observer clear | /observer history
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
@@ -21,12 +22,6 @@ import * as fs from "fs";
 import * as path from "path";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
-
-interface Correction {
-    turn: number;
-    phrase: string;
-    userMessage: string;
-}
 
 interface PainPoint {
     issue: string;
@@ -51,9 +46,7 @@ interface AgentDispatch {
 }
 
 interface SessionSignals {
-    corrections: Correction[];
     toolCounts: Record<string, number>;
-    toolExcess: string[];
     turnCount: number;
     firstUserMessage: string;
     filesRead: string[];
@@ -63,50 +56,36 @@ interface SessionSignals {
     totalTokens: number;
     totalCost: number;
     model: string;
-    consecutiveInputsWithoutToolCall: number;
     repromptCount: number;
-    // Subagent dispatch tracking
+    consecutiveInputsWithoutToolCall: number;
     dispatches: AgentDispatch[];
     dispatchCountByAgent: Record<string, number>;
-    dispatchDurationByAgent: Record<string, number>; // total ms per agent
+    dispatchDurationByAgent: Record<string, number>;
 }
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ─── Evaluator prompt ─────────────────────────────────────────────────────────
 
-const CORRECTION_PHRASES = [
-    "no wait", "actually", "ignore that", "that's wrong",
-    "not what i meant", "stop", "forget that", "wrong file",
-    "no that's not", "let me rephrase", "i meant", "no,",
-    "that's not right", "nevermind", "never mind",
-];
+const EVALUATOR_SYSTEM_PROMPT = `You are a technical workflow analyst for a Pi AI coding assistant.
 
-const TOOL_THRESHOLDS: Record<string, number> = {
-    read: 30,
-    bash: 20,
-    edit: 15,
-    write: 10,
-};
+You receive raw session metrics. Your job is to identify genuine technical workflow inefficiencies — not conversational ones.
 
-const EVALUATOR_SYSTEM_PROMPT = `You are a workflow analyst for an AI coding assistant.
-You analyse session signals to identify pain points and suggest improvements.
+Look for things like:
+- High file read count relative to files edited (over-reading, poor orientation)
+- Using write instead of edit (rewrites entire file unnecessarily)
+- High turn count for what seems like a simple task (poor decomposition)
+- High reprompt count (agent stalled, user had to nudge repeatedly)
+- Same tool called excessively (bash 30 times = probably a loop or retry problem)
+- Subagents dispatched many times to the same agent (redundant dispatching)
+- Long dispatch durations for simple tasks
 
-You receive structured data about a session:
-- Course corrections (user had to rephrase or redirect the agent)
-- Tool usage patterns (excessive tool use = poor orientation or indecision)
-- Turn counts (high turns for simple tasks = poor task decomposition)
-- Files touched (scope drift = agent edited unrelated files)
-- Reprompts (user sent multiple messages without agent acting)
-- Agent dispatches (which subagents were called and how long they took)
+Do NOT flag things like:
+- Normal tool usage
+- Reasonable turn counts
+- Clean sessions
 
-Your job:
-1. Identify pain points from the signals (if any)
-2. Determine root cause for each
-3. Suggest ONE specific, actionable fix per pain point — exact text to add/change in a system prompt
-4. Rate overall session efficiency (1-10)
+If signals look normal, return an empty painPoints array — do not invent problems.
 
-Be direct. Prioritise signal over noise. One correction might be nothing.
-Three corrections on the same type of task = a pattern worth fixing.
-If signals are low and the session was efficient, return an empty painPoints array.
+For each pain point you find, suggest ONE specific actionable fix — exact text to add or change in a system prompt or agent file.
 
 You MUST respond with valid JSON only — no markdown, no explanation outside the JSON:
 
@@ -114,10 +93,10 @@ You MUST respond with valid JSON only — no markdown, no explanation outside th
   "efficiency": 8,
   "painPoints": [
     {
-      "issue": "Agent read 23 files before acting",
-      "rootCause": "No codebase orientation in system prompt",
-      "fix": "Add to system prompt: 'Before reading files, ask the user which directory or file is most relevant to the task.'",
-      "target": "system prompt or agent name if known"
+      "issue": "Agent read 23 files but only edited 1",
+      "rootCause": "No codebase orientation — agent explored broadly before acting",
+      "fix": "Add to system prompt: 'Ask the user which file or directory to focus on before reading broadly.'",
+      "target": "system prompt"
     }
   ],
   "summary": "2-3 sentence plain English summary. Empty string if session was clean."
@@ -152,32 +131,18 @@ function buildSignalSummary(signals: SessionSignals): string {
     lines.push(`## Session Signals\n`);
     lines.push(`- **Duration:** ${formatDuration(signals.endTime - signals.startTime)}`);
     lines.push(`- **Turns:** ${signals.turnCount}`);
+    lines.push(`- **Reprompts:** ${signals.repromptCount}`);
     lines.push(`- **Model:** ${signals.model}`);
     lines.push(`- **Total cost:** $${signals.totalCost.toFixed(4)}`);
     lines.push(`- **Total tokens:** ${signals.totalTokens}`);
     lines.push(``);
-
-    lines.push(`### Corrections (${signals.corrections.length})`);
-    if (signals.corrections.length === 0) {
-        lines.push(`None detected.`);
-    } else {
-        signals.corrections.forEach((c, i) => {
-            lines.push(`${i + 1}. Turn ${c.turn} — triggered by "${c.phrase}": "${c.userMessage.slice(0, 80)}"`);
-        });
-    }
-    lines.push(``);
-
-
 
     lines.push(`### Tool Usage`);
     const toolEntries = Object.entries(signals.toolCounts).sort(([, a], [, b]) => b - a);
     if (toolEntries.length === 0) {
         lines.push(`No tools called.`);
     } else {
-        toolEntries.forEach(([name, count]) => {
-            const excess = signals.toolExcess.includes(name) ? " ⚠️ excess" : "";
-            lines.push(`- ${name}: ${count}${excess}`);
-        });
+        toolEntries.forEach(([name, count]) => lines.push(`- ${name}: ${count}`));
     }
     lines.push(``);
 
@@ -191,18 +156,16 @@ function buildSignalSummary(signals: SessionSignals): string {
 
     lines.push(`### First User Message`);
     lines.push(`> ${signals.firstUserMessage.slice(0, 200)}`);
-    lines.push(``);
 
     if (signals.dispatches.length > 0) {
+        lines.push(``);
         lines.push(`### Agent Dispatches (${signals.dispatches.length})`);
-        // Summary by agent
         Object.entries(signals.dispatchCountByAgent).forEach(([agent, count]) => {
             const totalMs = signals.dispatchDurationByAgent[agent] ?? 0;
             const avgMs = Math.round(totalMs / count);
             lines.push(`- **${agent}**: called ${count}x — avg ${formatDuration(avgMs)} per call`);
         });
         lines.push(``);
-        // Individual dispatches
         signals.dispatches.forEach((d, i) => {
             const dur = d.durationMs ? ` (${formatDuration(d.durationMs)})` : "";
             lines.push(`${i + 1}. \`${d.agent}\`${dur} — "${d.task.slice(0, 80)}"`);
@@ -231,16 +194,15 @@ async function runEvaluator(signals: SessionSignals, ctx: ExtensionContext): Pro
         });
 
         const signalJson = JSON.stringify({
-            corrections: signals.corrections,
             toolCounts: signals.toolCounts,
-            toolExcess: signals.toolExcess,
             turnCount: signals.turnCount,
-            firstUserMessage: signals.firstUserMessage,
-            filesRead: signals.filesRead.length,
-            filesEdited: signals.filesEdited,
-            duration: formatDuration(signals.endTime - signals.startTime),
             repromptCount: signals.repromptCount,
+            filesRead: signals.filesRead.length,
+            filesEdited: signals.filesEdited.length,
+            filesEditedList: signals.filesEdited,
+            duration: formatDuration(signals.endTime - signals.startTime),
             totalCost: signals.totalCost,
+            firstUserMessage: signals.firstUserMessage,
             agentDispatches: signals.dispatches.length > 0 ? {
                 total: signals.dispatches.length,
                 byAgent: signals.dispatchCountByAgent,
@@ -253,10 +215,9 @@ async function runEvaluator(signals: SessionSignals, ctx: ExtensionContext): Pro
         }, null, 2);
 
         await session.prompt(
-            `Analyse this Pi coding session.\n\nSession data:\n\`\`\`json\n${signalJson}\n\`\`\``
+            `Analyse this Pi coding session for technical workflow inefficiencies.\n\nSession data:\n\`\`\`json\n${signalJson}\n\`\`\``
         );
 
-        // Extract last assistant message
         let raw = "";
         for (const entry of session.sessionManager.getBranch()) {
             if (entry.type === "message" && entry.message.role === "assistant") {
@@ -269,21 +230,15 @@ async function runEvaluator(signals: SessionSignals, ctx: ExtensionContext): Pro
 
         if (!raw) return fallback;
 
-        // Strip markdown code fences if model wrapped JSON in them
         const cleaned = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
         return JSON.parse(cleaned) as EvaluationResult;
 
-    } catch (err) {
-        // Return fallback silently — don't crash the session shutdown
+    } catch {
         return fallback;
     }
 }
 
-function writeReport(
-    signals: SessionSignals,
-    evaluation: EvaluationResult,
-    observerDir: string
-) {
+function writeReport(signals: SessionSignals, evaluation: EvaluationResult, observerDir: string) {
     const sessionsDir = path.join(observerDir, "sessions");
     ensureDir(sessionsDir);
 
@@ -340,19 +295,11 @@ async function generateReport(
 
     signals.endTime = Date.now();
 
-    // Accumulate token/cost from session
     for (const entry of ctx.sessionManager.getBranch()) {
         if (entry.type === "message" && entry.message.role === "assistant") {
             const msg = entry.message as AssistantMessage;
             signals.totalTokens += (msg.usage?.input ?? 0) + (msg.usage?.output ?? 0);
             signals.totalCost += msg.usage?.cost?.total ?? 0;
-        }
-    }
-
-    // Check tool excess
-    for (const [tool, count] of Object.entries(signals.toolCounts)) {
-        if (TOOL_THRESHOLDS[tool] && count > TOOL_THRESHOLDS[tool]) {
-            signals.toolExcess.push(tool);
         }
     }
 
@@ -362,10 +309,7 @@ async function generateReport(
     return { reportPath, evaluation };
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
 function agentFilePath(cwd: string, target: string): string | null {
-    // Try to resolve a target like "scout" → .pi/agents/scout.md
     const candidates = [
         path.join(cwd, ".pi", "agents", `${target}.md`),
         path.join(cwd, ".pi", "agents", target),
@@ -375,7 +319,7 @@ function agentFilePath(cwd: string, target: string): string | null {
 
 function buildDiff(filePath: string | null, fix: string): string {
     if (!filePath || !fs.existsSync(filePath)) {
-        return `[New content to add to system prompt]\n+ ${fix}`;
+        return `[New content — no existing agent file found for this target]\n+ ${fix}`;
     }
     const current = fs.readFileSync(filePath, "utf8");
     return `File: ${filePath}\n\nCurrent (last 5 lines):\n${current.split("\n").slice(-5).map(l => `  ${l}`).join("\n")}\n\nWill append:\n+ ${fix}`;
@@ -385,10 +329,9 @@ function buildDiff(filePath: string | null, fix: string): string {
 
 export default function (pi: ExtensionAPI) {
     let lastEvaluation: EvaluationResult | null = null;
+
     const emptySignals = (): SessionSignals => ({
-        corrections: [],
         toolCounts: {},
-        toolExcess: [],
         turnCount: 0,
         firstUserMessage: "",
         filesRead: [],
@@ -398,35 +341,30 @@ export default function (pi: ExtensionAPI) {
         totalTokens: 0,
         totalCost: 0,
         model: "",
-        consecutiveInputsWithoutToolCall: 0,
         repromptCount: 0,
+        consecutiveInputsWithoutToolCall: 0,
         dispatches: [],
         dispatchCountByAgent: {},
         dispatchDurationByAgent: {},
     });
 
     let signals: SessionSignals = emptySignals();
-
-    // Track in-flight dispatches by toolCallId → start time
     const inFlightDispatches = new Map<string, { agent: string; task: string; startTime: number }>();
 
-    let currentTurn = 0;
     let toolCalledThisTurn = false;
 
     function resetSignals() {
         signals = emptySignals();
         inFlightDispatches.clear();
-        currentTurn = 0;
         toolCalledThisTurn = false;
     }
 
     function updateStatus(ctx: ExtensionContext) {
-        const parts = [];
-        if (signals.corrections.length > 0) parts.push(`${signals.corrections.length} corrections`);
-
+        const parts: string[] = [];
         const topTool = Object.entries(signals.toolCounts).sort(([, a], [, b]) => b - a)[0];
         if (topTool) parts.push(`${topTool[0]}:${topTool[1]}`);
-        if (signals.dispatches.length > 0) parts.push(`${signals.dispatches.length} dispatches`);
+        if (signals.repromptCount > 0) parts.push(`reprompts:${signals.repromptCount}`);
+        if (signals.dispatches.length > 0) parts.push(`dispatches:${signals.dispatches.length}`);
 
         const text = parts.length > 0
             ? ctx.ui.theme.fg("dim", `👁 ${parts.join(" · ")}`)
@@ -444,31 +382,16 @@ export default function (pi: ExtensionAPI) {
 
     // ── input ─────────────────────────────────────────────────────────────────
     pi.on("input", async (event, ctx) => {
-        const text = event.text.toLowerCase().trim();
-
-        // Capture first user message
         if (!signals.firstUserMessage) {
             signals.firstUserMessage = event.text;
         }
 
-        // Detect corrections
-        for (const phrase of CORRECTION_PHRASES) {
-            if (text.startsWith(phrase) || text.includes(` ${phrase}`)) {
-                signals.corrections.push({
-                    turn: currentTurn,
-                    phrase,
-                    userMessage: event.text,
-                });
-                updateStatus(ctx);
-                break;
-            }
-        }
-
-        // Detect reprompts — consecutive inputs without a tool call
+        // Reprompt: user sent input without the agent calling any tool in the previous turn
         if (!toolCalledThisTurn && signals.turnCount > 0) {
             signals.consecutiveInputsWithoutToolCall++;
             if (signals.consecutiveInputsWithoutToolCall >= 2) {
                 signals.repromptCount++;
+                updateStatus(ctx);
             }
         } else {
             signals.consecutiveInputsWithoutToolCall = 0;
@@ -478,8 +401,7 @@ export default function (pi: ExtensionAPI) {
     });
 
     // ── turn_start ────────────────────────────────────────────────────────────
-    pi.on("turn_start", async (event) => {
-        currentTurn = event.turnIndex;
+    pi.on("turn_start", async (_event) => {
         toolCalledThisTurn = false;
     });
 
@@ -490,10 +412,9 @@ export default function (pi: ExtensionAPI) {
     });
 
     // ── tool_call ─────────────────────────────────────────────────────────────
-    pi.on("tool_call", async (event, ctx) => {
+    pi.on("tool_call", async (event, _ctx) => {
         toolCalledThisTurn = true;
 
-        // Track agent dispatches (dispatch_agent or query_experts)
         if (event.toolName === "dispatch_agent") {
             const input = event.input as { agent: string; task: string };
             inFlightDispatches.set(event.toolCallId, {
@@ -505,7 +426,6 @@ export default function (pi: ExtensionAPI) {
 
         if (event.toolName === "query_experts") {
             const input = event.input as { queries: { expert: string; question: string }[] };
-            // query_experts dispatches multiple in parallel — track each
             (input.queries ?? []).forEach((q, i) => {
                 inFlightDispatches.set(`${event.toolCallId}-${i}`, {
                     agent: q.expert,
@@ -515,19 +435,14 @@ export default function (pi: ExtensionAPI) {
             });
         }
 
-        // Track file scope
         if (isToolCallEventType("read", event)) {
             const filePath = event.input.path;
-            if (!signals.filesRead.includes(filePath)) {
-                signals.filesRead.push(filePath);
-            }
+            if (!signals.filesRead.includes(filePath)) signals.filesRead.push(filePath);
         }
 
         if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
             const filePath = event.input.path;
-            if (!signals.filesEdited.includes(filePath)) {
-                signals.filesEdited.push(filePath);
-            }
+            if (!signals.filesEdited.includes(filePath)) signals.filesEdited.push(filePath);
         }
     });
 
@@ -535,43 +450,25 @@ export default function (pi: ExtensionAPI) {
     pi.on("tool_execution_end", async (event, ctx) => {
         signals.toolCounts[event.toolName] = (signals.toolCounts[event.toolName] || 0) + 1;
 
-        // Resolve in-flight dispatch_agent
         if (event.toolName === "dispatch_agent") {
             const inflight = inFlightDispatches.get(event.toolCallId);
             if (inflight) {
                 const durationMs = Date.now() - inflight.startTime;
-                const dispatch: AgentDispatch = {
-                    ...inflight,
-                    endTime: Date.now(),
-                    durationMs,
-                    toolCallId: event.toolCallId,
-                };
-                signals.dispatches.push(dispatch);
-                signals.dispatchCountByAgent[inflight.agent] =
-                    (signals.dispatchCountByAgent[inflight.agent] || 0) + 1;
-                signals.dispatchDurationByAgent[inflight.agent] =
-                    (signals.dispatchDurationByAgent[inflight.agent] || 0) + durationMs;
+                signals.dispatches.push({ ...inflight, endTime: Date.now(), durationMs, toolCallId: event.toolCallId });
+                signals.dispatchCountByAgent[inflight.agent] = (signals.dispatchCountByAgent[inflight.agent] || 0) + 1;
+                signals.dispatchDurationByAgent[inflight.agent] = (signals.dispatchDurationByAgent[inflight.agent] || 0) + durationMs;
                 inFlightDispatches.delete(event.toolCallId);
             }
         }
 
-        // Resolve in-flight query_experts (parallel — match by prefix)
         if (event.toolName === "query_experts") {
-            const keys = Array.from(inFlightDispatches.keys())
-                .filter(k => k.startsWith(event.toolCallId));
+            const keys = Array.from(inFlightDispatches.keys()).filter(k => k.startsWith(event.toolCallId));
             keys.forEach(key => {
                 const inflight = inFlightDispatches.get(key)!;
                 const durationMs = Date.now() - inflight.startTime;
-                signals.dispatches.push({
-                    ...inflight,
-                    endTime: Date.now(),
-                    durationMs,
-                    toolCallId: key,
-                });
-                signals.dispatchCountByAgent[inflight.agent] =
-                    (signals.dispatchCountByAgent[inflight.agent] || 0) + 1;
-                signals.dispatchDurationByAgent[inflight.agent] =
-                    (signals.dispatchDurationByAgent[inflight.agent] || 0) + durationMs;
+                signals.dispatches.push({ ...inflight, endTime: Date.now(), durationMs, toolCallId: key });
+                signals.dispatchCountByAgent[inflight.agent] = (signals.dispatchCountByAgent[inflight.agent] || 0) + 1;
+                signals.dispatchDurationByAgent[inflight.agent] = (signals.dispatchDurationByAgent[inflight.agent] || 0) + durationMs;
                 inFlightDispatches.delete(key);
             });
         }
@@ -581,7 +478,7 @@ export default function (pi: ExtensionAPI) {
 
     // ── session_shutdown ──────────────────────────────────────────────────────
     pi.on("session_shutdown", async (_event, _ctx) => {
-        // Evaluation is explicit via /observer evaluate — nothing happens on exit
+        // Evaluation is explicit via /observer evaluate — nothing on exit
     });
 
     // ── Commands ──────────────────────────────────────────────────────────────
@@ -619,16 +516,14 @@ export default function (pi: ExtensionAPI) {
             // ── fix ───────────────────────────────────────────────────────────
             } else if (cmd === "fix") {
                 if (!lastEvaluation) {
-                    ctx.ui.notify("No evaluation available. Run a session first.", "warning");
+                    ctx.ui.notify("Run /observer evaluate first.", "warning");
                     return;
                 }
-
                 if (lastEvaluation.painPoints.length === 0) {
                     ctx.ui.notify("👁 No pain points to fix — session was clean.", "info");
                     return;
                 }
 
-                // Walk through each pain point
                 for (const point of lastEvaluation.painPoints) {
                     const agentFile = agentFilePath(ctx.cwd, point.target);
                     const diff = buildDiff(agentFile, point.fix);
@@ -640,13 +535,11 @@ export default function (pi: ExtensionAPI) {
 
                     if (confirmed) {
                         if (agentFile && fs.existsSync(agentFile)) {
-                            // Append fix to existing agent file
                             fs.appendFileSync(agentFile, `\n\n## Observer Suggestion\n${point.fix}\n`, "utf8");
                             ctx.ui.notify(`✅ Applied to ${path.basename(agentFile)}`, "info");
-                        } else if (agentFile === null) {
-                            // No agent loaded — suggest creating one
+                        } else {
                             ctx.ui.notify(
-                                `No agent file found for "${point.target}".\nConsider creating .pi/agents/${point.target}.md with this instruction:\n${point.fix}`,
+                                `No agent file found for "${point.target}".\nCreate .pi/agents/${point.target}.md with:\n${point.fix}`,
                                 "info"
                             );
                         }
@@ -690,8 +583,20 @@ export default function (pi: ExtensionAPI) {
                 }
                 ctx.ui.notify(`Last ${files.length} sessions:\n${files.join("\n")}`, "info");
 
+            // ── help ──────────────────────────────────────────────────────────
+            } else if (cmd === "help" || cmd === "") {
+                ctx.ui.notify(
+                    `👁 Session Observer — commands:\n\n` +
+                    `  /observer evaluate  — analyse session, surface pain points\n` +
+                    `  /observer fix       — show diff + confirm + apply suggestions\n` +
+                    `  /observer report    — save full markdown report to .pi/observer/sessions/\n` +
+                    `  /observer clear     — reset all signals for this session\n` +
+                    `  /observer history   — list last 5 session reports\n` +
+                    `  /observer help      — show this message`,
+                    "info"
+                );
             } else {
-                ctx.ui.notify("Usage: /observer evaluate | /observer fix | /observer report | /observer clear | /observer history", "info");
+                ctx.ui.notify(`Unknown command: /observer ${cmd}\nType /observer help for usage.`, "warning");
             }
         }
     });
