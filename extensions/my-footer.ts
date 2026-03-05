@@ -21,7 +21,7 @@ function getGitBranch(cwd: string): string {
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
-		ctx.ui.setFooter((_tui, theme, _footerData) => ({
+		ctx.ui.setFooter((_tui, theme, footerData) => ({
 			dispose: () => {},
 			invalidate() {},
 			render(width: number): string[] {
@@ -43,7 +43,16 @@ export default function (pi: ExtensionAPI) {
 				const right = theme.fg("dim", `[${bar}] ${Math.round(pct)}% `);
 
 				const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
-				return [truncateToWidth(left + pad + right, width)];
+				const lines = [truncateToWidth(left + pad + right, width)];
+
+				// Render status slots from other extensions (setStatus calls)
+				const statuses = footerData.getExtensionStatuses();
+				if (statuses.size > 0) {
+					const statusLine = Array.from(statuses.values()).join("  ");
+					lines.push(truncateToWidth(statusLine, width));
+				}
+
+				return lines;
 			},
 		}));
 	});
