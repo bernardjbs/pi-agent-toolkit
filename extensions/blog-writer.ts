@@ -235,11 +235,13 @@ export default function (pi: ExtensionAPI) {
                 const filepath = path.join(draftsDir, `${section.slug}.md`);
                 fs.writeFileSync(filepath, draft, "utf8");
 
-                ctx.ui.notify(
-                    `✅ Draft saved: .pi/blog/drafts/${section.slug}.md\n\n` +
-                    `Preview (first 300 chars):\n${draft.slice(0, 300)}...`,
-                    "info"
-                );
+                // Open draft in editor — read full content, optionally refine inline
+                const edited = await ctx.ui.editor(`📝 Draft: ${section.title}`, draft);
+                const finalDraft = edited ?? draft;
+
+                // Save (possibly edited) draft
+                fs.writeFileSync(filepath, finalDraft, "utf8");
+                ctx.ui.notify(`✅ Draft saved: .pi/blog/drafts/${section.slug}.md`, "info");
 
             // ── drafts ────────────────────────────────────────────────────────
             } else if (cmd === "drafts") {
