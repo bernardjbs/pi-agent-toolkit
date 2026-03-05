@@ -28,6 +28,19 @@ interface Correction {
     userMessage: string;
 }
 
+interface PainPoint {
+    issue: string;
+    rootCause: string;
+    fix: string;
+    target: string;
+}
+
+interface EvaluationResult {
+    efficiency: number;
+    painPoints: PainPoint[];
+    summary: string;
+}
+
 interface AgentDispatch {
     agent: string;
     task: string;
@@ -83,32 +96,32 @@ You receive structured data about a session:
 - Turn counts (high turns for simple tasks = poor task decomposition)
 - Files touched (scope drift = agent edited unrelated files)
 - Reprompts (user sent multiple messages without agent acting)
+- Agent dispatches (which subagents were called and how long they took)
 
 Your job:
-1. Identify the top 3 pain points from this session
-2. Determine their root cause (bad system prompt? wrong tools? unclear scope?)
-3. Suggest specific, actionable system prompt improvements
+1. Identify pain points from the signals (if any)
+2. Determine root cause for each
+3. Suggest ONE specific, actionable fix per pain point — exact text to add/change in a system prompt
 4. Rate overall session efficiency (1-10)
 
 Be direct. Prioritise signal over noise. One correction might be nothing.
 Three corrections on the same type of task = a pattern worth fixing.
-If signals are low, say so — a good session deserves a high score.
+If signals are low and the session was efficient, return an empty painPoints array.
 
-Output format (use exactly these headings):
-## Session Efficiency: X/10
+You MUST respond with valid JSON only — no markdown, no explanation outside the JSON:
 
-## Pain Points
-1. [pain point] — [root cause]
-2. [pain point] — [root cause]
-3. [pain point] — [root cause]
-
-## Suggested System Prompt Improvements
-1. Add: "[exact text to add to system prompt]"
-2. Remove: "[what to remove]"
-3. Change: "[what to change] → [new version]"
-
-## Summary
-[2-3 sentence plain English summary of this session's main issue]`;
+{
+  "efficiency": 8,
+  "painPoints": [
+    {
+      "issue": "Agent read 23 files before acting",
+      "rootCause": "No codebase orientation in system prompt",
+      "fix": "Add to system prompt: 'Before reading files, ask the user which directory or file is most relevant to the task.'",
+      "target": "system prompt or agent name if known"
+    }
+  ],
+  "summary": "2-3 sentence plain English summary. Empty string if session was clean."
+}`;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -199,7 +212,9 @@ function buildSignalSummary(signals: SessionSignals): string {
     return lines.join("\n");
 }
 
-async function runEvaluator(signals: SessionSignals, ctx: ExtensionContext): Promise<string> {
+async function runEvaluator(signals: SessionSignals, ctx: ExtensionContext): Promise<EvaluationResult> {
+    const fallback: EvaluationResult = { efficiency: 10, painPoints: [], summary: "" };
+
     try {
         const loader = new DefaultResourceLoader({
             systemPromptOverride: () => EVALUATOR_SYSTEM_PROMPT,
@@ -210,7 +225,7 @@ async function runEvaluator(signals: SessionSignals, ctx: ExtensionContext): Pro
         const { session } = await createAgentSession({
             cwd: ctx.cwd,
             model: ctx.model ?? undefined,
-            tools: [], // read-only evaluator — no tools needed
+            tools: [],
             resourceLoader: loader,
             sessionManager: SessionManager.inMemory(),
         });
@@ -237,33 +252,36 @@ async function runEvaluator(signals: SessionSignals, ctx: ExtensionContext): Pro
             } : null,
         }, null, 2);
 
-        let result = "";
         await session.prompt(
-            `Analyse this Pi coding session and provide improvement suggestions.\n\nSession data:\n\`\`\`json\n${signalJson}\n\`\`\``
+            `Analyse this Pi coding session.\n\nSession data:\n\`\`\`json\n${signalJson}\n\`\`\``
         );
 
-        // Extract the last assistant message
-        const entries = session.sessionManager.getBranch();
-        for (const entry of entries) {
+        // Extract last assistant message
+        let raw = "";
+        for (const entry of session.sessionManager.getBranch()) {
             if (entry.type === "message" && entry.message.role === "assistant") {
                 const msg = entry.message as AssistantMessage;
                 for (const block of msg.content) {
-                    if (block.type === "text") {
-                        result = block.text;
-                    }
+                    if (block.type === "text") raw = block.text;
                 }
             }
         }
 
-        return result || "Evaluator returned no output.";
+        if (!raw) return fallback;
+
+        // Strip markdown code fences if model wrapped JSON in them
+        const cleaned = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
+        return JSON.parse(cleaned) as EvaluationResult;
+
     } catch (err) {
-        return `Evaluator failed: ${err instanceof Error ? err.message : String(err)}`;
+        // Return fallback silently — don't crash the session shutdown
+        return fallback;
     }
 }
 
 function writeReport(
     signals: SessionSignals,
-    evaluation: string,
+    evaluation: EvaluationResult,
     observerDir: string
 ) {
     const sessionsDir = path.join(observerDir, "sessions");
@@ -272,6 +290,31 @@ function writeReport(
     const filename = `${formatFilename(signals.startTime)}.md`;
     const filepath = path.join(sessionsDir, filename);
 
+    const evalLines = [
+        `## Evaluation`,
+        ``,
+        `**Efficiency:** ${evaluation.efficiency}/10`,
+        ``,
+    ];
+
+    if (evaluation.painPoints.length === 0) {
+        evalLines.push(`No significant pain points detected.`);
+    } else {
+        evaluation.painPoints.forEach((p, i) => {
+            evalLines.push(`### Pain Point ${i + 1}: ${p.issue}`);
+            evalLines.push(`- **Root cause:** ${p.rootCause}`);
+            evalLines.push(`- **Target:** ${p.target}`);
+            evalLines.push(`- **Suggested fix:** ${p.fix}`);
+            evalLines.push(``);
+        });
+    }
+
+    if (evaluation.summary) {
+        evalLines.push(`---`);
+        evalLines.push(``);
+        evalLines.push(`**Summary:** ${evaluation.summary}`);
+    }
+
     const content = [
         `# Session Report — ${formatDate(signals.startTime)}`,
         ``,
@@ -279,20 +322,21 @@ function writeReport(
         ``,
         `---`,
         ``,
-        `## Evaluation`,
-        ``,
-        evaluation,
+        ...evalLines,
     ].join("\n");
 
     fs.writeFileSync(filepath, content, "utf8");
     return filepath;
 }
 
-async function generateReport(signals: SessionSignals, ctx: ExtensionContext): Promise<string> {
+async function generateReport(
+    signals: SessionSignals,
+    ctx: ExtensionContext
+): Promise<{ reportPath: string; evaluation: EvaluationResult }> {
     const observerDir = path.join(ctx.cwd, ".pi", "observer");
     ensureDir(observerDir);
 
-    ctx.ui.notify("👁 Session Observer: Analysing session...", "info");
+    ctx.ui.notify("👁 Analysing session...", "info");
 
     signals.endTime = Date.now();
 
@@ -315,12 +359,32 @@ async function generateReport(signals: SessionSignals, ctx: ExtensionContext): P
     const evaluation = await runEvaluator(signals, ctx);
     const reportPath = writeReport(signals, evaluation, observerDir);
 
-    return reportPath;
+    return { reportPath, evaluation };
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function agentFilePath(cwd: string, target: string): string | null {
+    // Try to resolve a target like "scout" → .pi/agents/scout.md
+    const candidates = [
+        path.join(cwd, ".pi", "agents", `${target}.md`),
+        path.join(cwd, ".pi", "agents", target),
+    ];
+    return candidates.find(p => fs.existsSync(p)) ?? null;
+}
+
+function buildDiff(filePath: string | null, fix: string): string {
+    if (!filePath || !fs.existsSync(filePath)) {
+        return `[New content to add to system prompt]\n+ ${fix}`;
+    }
+    const current = fs.readFileSync(filePath, "utf8");
+    return `File: ${filePath}\n\nCurrent (last 5 lines):\n${current.split("\n").slice(-5).map(l => `  ${l}`).join("\n")}\n\nWill append:\n+ ${fix}`;
 }
 
 // ─── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+    let lastEvaluation: EvaluationResult | null = null;
     const emptySignals = (): SessionSignals => ({
         corrections: [],
         toolCounts: {},
@@ -517,38 +581,95 @@ export default function (pi: ExtensionAPI) {
 
     // ── session_shutdown ──────────────────────────────────────────────────────
     pi.on("session_shutdown", async (_event, ctx) => {
-        // Only generate report if there was meaningful activity
         if (signals.turnCount === 0) return;
 
         try {
-            const reportPath = await generateReport(signals, ctx);
-            ctx.ui.notify(`👁 Observer report saved: ${path.basename(path.dirname(reportPath))}/${path.basename(reportPath)}`);
+            const { evaluation } = await generateReport(signals, ctx);
+            lastEvaluation = evaluation;
+
+            if (evaluation.painPoints.length === 0) {
+                // Clean session — stay silent
+                return;
+            }
+
+            // Surface pain points
+            const top = evaluation.painPoints[0];
+            const more = evaluation.painPoints.length > 1
+                ? ` (+${evaluation.painPoints.length - 1} more)`
+                : "";
+
+            ctx.ui.notify(
+                `👁 Pain point detected${more}: ${top.issue}\nRun /observer fix to see suggestions`,
+                "warning"
+            );
         } catch (err) {
-            ctx.ui.notify(`👁 Observer failed to generate report: ${err instanceof Error ? err.message : String(err)}`, "error");
+            ctx.ui.notify(`👁 Observer error: ${err instanceof Error ? err.message : String(err)}`, "error");
         }
     });
 
     // ── Commands ──────────────────────────────────────────────────────────────
 
     pi.registerCommand("observer", {
-        description: "Session observer controls: report | clear | history",
+        description: "Session observer: fix | report | clear | history",
         handler: async (args, ctx) => {
             const cmd = (args ?? "").trim();
 
-            if (cmd === "report") {
+            // ── fix ───────────────────────────────────────────────────────────
+            if (cmd === "fix") {
+                if (!lastEvaluation) {
+                    ctx.ui.notify("No evaluation available. Run a session first.", "warning");
+                    return;
+                }
+
+                if (lastEvaluation.painPoints.length === 0) {
+                    ctx.ui.notify("👁 No pain points to fix — session was clean.", "info");
+                    return;
+                }
+
+                // Walk through each pain point
+                for (const point of lastEvaluation.painPoints) {
+                    const agentFile = agentFilePath(ctx.cwd, point.target);
+                    const diff = buildDiff(agentFile, point.fix);
+
+                    const confirmed = await ctx.ui.confirm(
+                        `👁 Pain Point: ${point.issue}`,
+                        `Root cause: ${point.rootCause}\n\n${diff}\n\nApply this fix?`
+                    );
+
+                    if (confirmed) {
+                        if (agentFile && fs.existsSync(agentFile)) {
+                            // Append fix to existing agent file
+                            fs.appendFileSync(agentFile, `\n\n## Observer Suggestion\n${point.fix}\n`, "utf8");
+                            ctx.ui.notify(`✅ Applied to ${path.basename(agentFile)}`, "info");
+                        } else if (agentFile === null) {
+                            // No agent loaded — suggest creating one
+                            ctx.ui.notify(
+                                `No agent file found for "${point.target}".\nConsider creating .pi/agents/${point.target}.md with this instruction:\n${point.fix}`,
+                                "info"
+                            );
+                        }
+                    }
+                }
+
+            // ── report ────────────────────────────────────────────────────────
+            } else if (cmd === "report") {
                 if (signals.turnCount === 0) {
                     ctx.ui.notify("No activity to report yet.", "warning");
                     return;
                 }
-                const reportPath = await generateReport({ ...signals }, ctx);
+                const { reportPath, evaluation } = await generateReport({ ...signals }, ctx);
+                lastEvaluation = evaluation;
                 ctx.ui.notify(`👁 Report saved: ${reportPath}`);
 
+            // ── clear ─────────────────────────────────────────────────────────
             } else if (cmd === "clear") {
                 resetSignals();
+                lastEvaluation = null;
                 signals.model = ctx.model?.id ?? "unknown";
                 ctx.ui.notify("👁 Observer signals cleared.", "info");
                 updateStatus(ctx);
 
+            // ── history ───────────────────────────────────────────────────────
             } else if (cmd === "history") {
                 const sessionsDir = path.join(ctx.cwd, ".pi", "observer", "sessions");
                 if (!fs.existsSync(sessionsDir)) {
@@ -565,11 +686,10 @@ export default function (pi: ExtensionAPI) {
                     ctx.ui.notify("No session reports yet.", "info");
                     return;
                 }
-
                 ctx.ui.notify(`Last ${files.length} sessions:\n${files.join("\n")}`, "info");
 
             } else {
-                ctx.ui.notify("Usage: /observer report | /observer clear | /observer history", "info");
+                ctx.ui.notify("Usage: /observer fix | /observer report | /observer clear | /observer history", "info");
             }
         }
     });
