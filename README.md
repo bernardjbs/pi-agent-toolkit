@@ -93,6 +93,17 @@ pi -e extensions/blog-writer.ts
 
 ---
 
+### `progress-tracker.ts` — Session Close Prompt
+On session shutdown, prompts you to update `PROGRESS.md` if there was meaningful activity. Opens the file in Pi's built-in editor so you can jot down where you left off before closing. Skips the prompt for empty sessions.
+
+**Concepts:** `session_shutdown`, `turn_end` for activity tracking, `ctx.ui.confirm()`, `ctx.ui.editor()`
+
+```bash
+pi -e extensions/progress-tracker.ts
+```
+
+---
+
 ## Specs
 
 Work-in-progress designs for extensions not yet built.

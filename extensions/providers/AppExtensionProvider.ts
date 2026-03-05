@@ -19,9 +19,11 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import myFooter from "../my-footer.js";
 import sessionObserver from "../session-observer.js";
 import blogWriter from "../blog-writer.js";
+import progressTracker from "../progress-tracker.js";
 
 export default function (pi: ExtensionAPI) {
     myFooter(pi);
     sessionObserver(pi);
     blogWriter(pi);
+    progressTracker(pi);
 }
