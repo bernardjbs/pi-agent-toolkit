@@ -28,6 +28,15 @@ interface Correction {
     userMessage: string;
 }
 
+interface AgentDispatch {
+    agent: string;
+    task: string;
+    startTime: number;
+    endTime?: number;
+    durationMs?: number;
+    toolCallId: string;
+}
+
 interface SessionSignals {
     corrections: Correction[];
     toolCounts: Record<string, number>;
@@ -43,6 +52,10 @@ interface SessionSignals {
     model: string;
     consecutiveInputsWithoutToolCall: number;
     repromptCount: number;
+    // Subagent dispatch tracking
+    dispatches: AgentDispatch[];
+    dispatchCountByAgent: Record<string, number>;
+    dispatchDurationByAgent: Record<string, number>; // total ms per agent
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -165,6 +178,23 @@ function buildSignalSummary(signals: SessionSignals): string {
 
     lines.push(`### First User Message`);
     lines.push(`> ${signals.firstUserMessage.slice(0, 200)}`);
+    lines.push(``);
+
+    if (signals.dispatches.length > 0) {
+        lines.push(`### Agent Dispatches (${signals.dispatches.length})`);
+        // Summary by agent
+        Object.entries(signals.dispatchCountByAgent).forEach(([agent, count]) => {
+            const totalMs = signals.dispatchDurationByAgent[agent] ?? 0;
+            const avgMs = Math.round(totalMs / count);
+            lines.push(`- **${agent}**: called ${count}x — avg ${formatDuration(avgMs)} per call`);
+        });
+        lines.push(``);
+        // Individual dispatches
+        signals.dispatches.forEach((d, i) => {
+            const dur = d.durationMs ? ` (${formatDuration(d.durationMs)})` : "";
+            lines.push(`${i + 1}. \`${d.agent}\`${dur} — "${d.task.slice(0, 80)}"`);
+        });
+    }
 
     return lines.join("\n");
 }
@@ -196,6 +226,15 @@ async function runEvaluator(signals: SessionSignals, ctx: ExtensionContext): Pro
             duration: formatDuration(signals.endTime - signals.startTime),
             repromptCount: signals.repromptCount,
             totalCost: signals.totalCost,
+            agentDispatches: signals.dispatches.length > 0 ? {
+                total: signals.dispatches.length,
+                byAgent: signals.dispatchCountByAgent,
+                durationByAgent: Object.fromEntries(
+                    Object.entries(signals.dispatchDurationByAgent).map(
+                        ([agent, ms]) => [agent, formatDuration(ms)]
+                    )
+                ),
+            } : null,
         }, null, 2);
 
         let result = "";
@@ -282,7 +321,7 @@ async function generateReport(signals: SessionSignals, ctx: ExtensionContext): P
 // ─── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-    let signals: SessionSignals = {
+    const emptySignals = (): SessionSignals => ({
         corrections: [],
         toolCounts: {},
         toolExcess: [],
@@ -297,28 +336,22 @@ export default function (pi: ExtensionAPI) {
         model: "",
         consecutiveInputsWithoutToolCall: 0,
         repromptCount: 0,
-    };
+        dispatches: [],
+        dispatchCountByAgent: {},
+        dispatchDurationByAgent: {},
+    });
+
+    let signals: SessionSignals = emptySignals();
+
+    // Track in-flight dispatches by toolCallId → start time
+    const inFlightDispatches = new Map<string, { agent: string; task: string; startTime: number }>();
 
     let currentTurn = 0;
     let toolCalledThisTurn = false;
 
     function resetSignals() {
-        signals = {
-            corrections: [],
-            toolCounts: {},
-            toolExcess: [],
-            turnCount: 0,
-            firstUserMessage: "",
-            filesRead: [],
-            filesEdited: [],
-            startTime: Date.now(),
-            endTime: 0,
-            totalTokens: 0,
-            totalCost: 0,
-            model: "",
-            consecutiveInputsWithoutToolCall: 0,
-            repromptCount: 0,
-        };
+        signals = emptySignals();
+        inFlightDispatches.clear();
         currentTurn = 0;
         toolCalledThisTurn = false;
     }
@@ -329,6 +362,7 @@ export default function (pi: ExtensionAPI) {
 
         const topTool = Object.entries(signals.toolCounts).sort(([, a], [, b]) => b - a)[0];
         if (topTool) parts.push(`${topTool[0]}:${topTool[1]}`);
+        if (signals.dispatches.length > 0) parts.push(`${signals.dispatches.length} dispatches`);
 
         const text = parts.length > 0
             ? ctx.ui.theme.fg("dim", `👁 ${parts.join(" · ")}`)
@@ -395,6 +429,28 @@ export default function (pi: ExtensionAPI) {
     pi.on("tool_call", async (event, ctx) => {
         toolCalledThisTurn = true;
 
+        // Track agent dispatches (dispatch_agent or query_experts)
+        if (event.toolName === "dispatch_agent") {
+            const input = event.input as { agent: string; task: string };
+            inFlightDispatches.set(event.toolCallId, {
+                agent: input.agent,
+                task: input.task,
+                startTime: Date.now(),
+            });
+        }
+
+        if (event.toolName === "query_experts") {
+            const input = event.input as { queries: { expert: string; question: string }[] };
+            // query_experts dispatches multiple in parallel — track each
+            (input.queries ?? []).forEach((q, i) => {
+                inFlightDispatches.set(`${event.toolCallId}-${i}`, {
+                    agent: q.expert,
+                    task: q.question,
+                    startTime: Date.now(),
+                });
+            });
+        }
+
         // Track file scope
         if (isToolCallEventType("read", event)) {
             const filePath = event.input.path;
@@ -414,6 +470,48 @@ export default function (pi: ExtensionAPI) {
     // ── tool_execution_end ────────────────────────────────────────────────────
     pi.on("tool_execution_end", async (event, ctx) => {
         signals.toolCounts[event.toolName] = (signals.toolCounts[event.toolName] || 0) + 1;
+
+        // Resolve in-flight dispatch_agent
+        if (event.toolName === "dispatch_agent") {
+            const inflight = inFlightDispatches.get(event.toolCallId);
+            if (inflight) {
+                const durationMs = Date.now() - inflight.startTime;
+                const dispatch: AgentDispatch = {
+                    ...inflight,
+                    endTime: Date.now(),
+                    durationMs,
+                    toolCallId: event.toolCallId,
+                };
+                signals.dispatches.push(dispatch);
+                signals.dispatchCountByAgent[inflight.agent] =
+                    (signals.dispatchCountByAgent[inflight.agent] || 0) + 1;
+                signals.dispatchDurationByAgent[inflight.agent] =
+                    (signals.dispatchDurationByAgent[inflight.agent] || 0) + durationMs;
+                inFlightDispatches.delete(event.toolCallId);
+            }
+        }
+
+        // Resolve in-flight query_experts (parallel — match by prefix)
+        if (event.toolName === "query_experts") {
+            const keys = Array.from(inFlightDispatches.keys())
+                .filter(k => k.startsWith(event.toolCallId));
+            keys.forEach(key => {
+                const inflight = inFlightDispatches.get(key)!;
+                const durationMs = Date.now() - inflight.startTime;
+                signals.dispatches.push({
+                    ...inflight,
+                    endTime: Date.now(),
+                    durationMs,
+                    toolCallId: key,
+                });
+                signals.dispatchCountByAgent[inflight.agent] =
+                    (signals.dispatchCountByAgent[inflight.agent] || 0) + 1;
+                signals.dispatchDurationByAgent[inflight.agent] =
+                    (signals.dispatchDurationByAgent[inflight.agent] || 0) + durationMs;
+                inFlightDispatches.delete(key);
+            });
+        }
+
         updateStatus(ctx);
     });
 
