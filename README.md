@@ -55,6 +55,26 @@ A framework that brings Laravel's developer experience to Pi — convention over
 
 ---
 
+## Conventions
+
+### Extension = plumbing. Agent file = instructions.
+
+Extensions (`.ts`) contain event wiring, tool registration, and command handlers — no hardcoded prompts.
+
+Subagent instructions live in `.pi/agents/<name>.md`. This keeps prompts editable without touching TypeScript, and makes tuning behaviour a markdown edit rather than a code change.
+
+| What | Where |
+|------|-------|
+| Tool registration, event hooks, commands | `extensions/<name>.ts` |
+| Subagent system prompts | `.pi/agents/<name>.md` |
+| Skills loaded into main session | `.pi/skills/<name>/SKILL.md` |
+
+**Examples in this repo:**
+- `blog-writer.ts` → instructions in `.pi/agents/blog-writer.md`
+- `session-observer.ts` → evaluator instructions in `.pi/agents/session-evaluator.md`
+
+---
+
 ## Key Concepts Learned
 
 ### The Pi event loop

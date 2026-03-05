@@ -63,44 +63,8 @@ interface SessionSignals {
     dispatchDurationByAgent: Record<string, number>;
 }
 
-// ─── Evaluator prompt ─────────────────────────────────────────────────────────
-
-const EVALUATOR_SYSTEM_PROMPT = `You are a technical workflow analyst for a Pi AI coding assistant.
-
-You receive raw session metrics. Your job is to identify genuine technical workflow inefficiencies — not conversational ones.
-
-Look for things like:
-- High file read count relative to files edited (over-reading, poor orientation)
-- Using write instead of edit (rewrites entire file unnecessarily)
-- High turn count for what seems like a simple task (poor decomposition)
-- High reprompt count (agent stalled, user had to nudge repeatedly)
-- Same tool called excessively (bash 30 times = probably a loop or retry problem)
-- Subagents dispatched many times to the same agent (redundant dispatching)
-- Long dispatch durations for simple tasks
-
-Do NOT flag things like:
-- Normal tool usage
-- Reasonable turn counts
-- Clean sessions
-
-If signals look normal, return an empty painPoints array — do not invent problems.
-
-For each pain point you find, suggest ONE specific actionable fix — exact text to add or change in a system prompt or agent file.
-
-You MUST respond with valid JSON only — no markdown, no explanation outside the JSON:
-
-{
-  "efficiency": 8,
-  "painPoints": [
-    {
-      "issue": "Agent read 23 files but only edited 1",
-      "rootCause": "No codebase orientation — agent explored broadly before acting",
-      "fix": "Add to system prompt: 'Ask the user which file or directory to focus on before reading broadly.'",
-      "target": "system prompt"
-    }
-  ],
-  "summary": "2-3 sentence plain English summary. Empty string if session was clean."
-}`;
+// Evaluator instructions live in .pi/agents/session-evaluator.md — not here.
+// Extension = plumbing. Agent file = instructions.
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -179,8 +143,16 @@ async function runEvaluator(signals: SessionSignals, ctx: ExtensionContext): Pro
     const fallback: EvaluationResult = { efficiency: 10, painPoints: [], summary: "" };
 
     try {
+        // Load evaluator instructions from .pi/agents/session-evaluator.md
+        // Extension = plumbing. Agent file = instructions.
+        const agentFile = path.join(ctx.cwd, ".pi", "agents", "session-evaluator.md");
+        const systemPrompt = fs.existsSync(agentFile)
+            ? fs.readFileSync(agentFile, "utf8")
+            : "You are a workflow analyst. Analyse session signals and return JSON with efficiency score and pain points.";
+
         const loader = new DefaultResourceLoader({
-            systemPromptOverride: () => EVALUATOR_SYSTEM_PROMPT,
+            cwd: ctx.cwd,
+            systemPromptOverride: () => systemPrompt,
             appendSystemPromptOverride: () => [],
         });
         await loader.reload();
