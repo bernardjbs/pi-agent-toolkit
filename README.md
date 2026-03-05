@@ -41,6 +41,36 @@ pi -e extensions/my-checkpoint.ts
 
 ---
 
+### `session-observer.ts` — Silent Workflow Analyst
+Silently tracks technical workflow signals throughout a session — tool usage, file read/edit ratios, reprompts, agent dispatch patterns. On demand, runs a subagent evaluator to surface pain points and suggest fixes to agent files.
+
+Writer instructions live in `.pi/agents/session-evaluator.md` — tune what gets flagged without touching TypeScript.
+
+**Commands:** `/observer evaluate` · `/observer fix` · `/observer report` · `/observer clear` · `/observer history` · `/observer help`
+
+**Concepts:** `session_start`, `tool_call` + `tool_execution_end` for timing, `createAgentSession` subagent evaluator, `ctx.ui.confirm()` for diff + approve flow, `setStatus`
+
+```bash
+pi -e extensions/session-observer.ts
+```
+
+---
+
+### `blog-writer.ts` — Draft Blog Posts from Markdown Notes
+Points at any markdown file, lists its `##` sections, and drafts polished blog posts from them using a subagent writer. Opens each draft in Pi's built-in editor for review and inline editing before saving.
+
+Writer instructions live in `.pi/agents/blog-writer.md` — tune the tone, style, and format without touching TypeScript.
+
+**Commands:** `/blog set <file>` · `/blog list` · `/blog draft <topic or number>` · `/blog drafts` · `/blog help`
+
+**Concepts:** `createAgentSession` subagent writer, `DefaultResourceLoader` with agent file, `ctx.ui.editor()` for full draft review, markdown section parsing
+
+```bash
+pi -e extensions/blog-writer.ts
+```
+
+---
+
 ## Specs
 
 Work-in-progress designs for extensions not yet built.
